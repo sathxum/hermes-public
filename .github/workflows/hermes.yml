@@ -1,0 +1,128 @@
+name: Hermes Agent Desktop - Public ngrok
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  hermes-dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+    - name: System Info
+      run: |
+        echo "══════════════════════════════════════════"
+        echo "  HERMES AGENT DESKTOP - ngrok PUBLIC"
+        echo "══════════════════════════════════════════"
+        echo "Runner: $(uname -a)"
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl wget git ca-certificates ffmpeg openssl unzip jq
+        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+
+    - name: Install Hermes Agent
+      run: |
+        curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+        export PATH="$HOME/.hermes/bin:$PATH"
+        which hermes
+
+    - name: Install ngrok
+      run: |
+        wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+        tar -xzf ngrok-v3-stable-linux-amd64.tgz
+        sudo mv ngrok /usr/local/bin/
+        ngrok version
+
+    - name: Pre-build Dashboard
+      run: |
+        export PATH="$HOME/.hermes/bin:$PATH"
+        WEB_DIR="$HOME/.hermes/hermes-agent/website/dashboard"
+        if [ -d "$WEB_DIR" ]; then
+          cd "$WEB_DIR"
+          npm install 2>&1 | tail -10 || true
+        fi
+
+    - name: Start Hermes Dashboard
+      run: |
+        export PATH="$HOME/.hermes/bin:$PATH"
+        SECRET=$(openssl rand -hex 24)
+        echo "::add-mask::$SECRET"
+        echo "HERMES_API_SECRET=$SECRET" >> "$GITHUB_ENV"
+        
+        nohup hermes dashboard --port 9119 --host 0.0.0.0 --insecure --api-secret "$SECRET" > /tmp/dashboard.log 2>&1 &
+        echo $! > /tmp/hermes.pid
+        
+        for i in $(seq 1 60); do
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9119 2>/dev/null || echo "000")
+          [ "$CODE" = "200" ] || [ "$CODE" = "302" ] && echo "✅ Dashboard UP" && break
+          sleep 2
+        done
+
+    - name: Start ngrok Tunnel
+      id: ngrok
+      run: |
+        nohup ngrok http 9119 --log=stdout > /tmp/ngrok.log 2>&1 &
+        sleep 15
+        
+        # Get ngrok URL
+        URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url' 2>/dev/null || true)
+        
+        if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+          echo "tunnel_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "╔════════════════════════════════════════╗"
+          echo "║     🎉 HERMES AGENT IS LIVE! 🎉        ║"
+          echo "╚════════════════════════════════════════╝"
+          echo "  PUBLIC URL: $URL"
+          echo "$URL" > /tmp/tunnel_url.txt
+        else
+          echo "❌ ngrok URL not found"
+          tail -20 /tmp/ngrok.log
+          exit 1
+        fi
+
+    - name: Post URL as Commit Status
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        URL=$(cat /tmp/tunnel_url.txt)
+        SHA="${{ github.sha }}"
+        
+        curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/statuses/$SHA" \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          -d "{
+            \"state\": \"success\",
+            \"target_url\": \"$URL\",
+            \"description\": \"Hermes Dashboard URL: $URL\",
+            \"context\": \"hermes-dashboard-url\"
+          }"
+        
+        echo "✅ Posted URL to commit status: $URL"
+
+    - name: Create Issue with URL
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        URL=$(cat /tmp/tunnel_url.txt)
+        
+        curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          -d "{
+            \"title\": \"🌐 Hermes Dashboard URL\",
+            \"body\": \"## 🔗 Connection Info\\n\\n**Dashboard URL:** $URL\\n\\n**Auth Secret:** \`\`\`\\n${{ env.HERMES_API_SECRET }}\\n\`\`\`\\n\\n---\\n\\n_This issue is auto-created by GitHub Actions workflow._\\n\\n**Note:** Tunnel is valid for 6 hours.\",
+            \"labels\": [\"dashboard\", \"url\"]
+          }"
+        
+        echo "✅ Created issue with connection info"
+
+    - name: Keep Alive (6 hours)
+      run: |
+        for i in $(seq 360 -1 1); do
+          echo "⏱ Remaining: $i min"
+          [ $((i % 60)) -eq 0 ] && curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url' || true
+          sleep 60
+        done
